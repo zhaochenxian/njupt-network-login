@@ -57,7 +57,6 @@ def main():
         "--collect-all=urllib3",                # 收集 urllib3 依赖
         "--hidden-import=requests",
         "--hidden-import=urllib3",
-        "--distpath=.",                         # 输出到当前目录的 dist 文件夹
         network_monitor_path
     ]
     
@@ -97,7 +96,7 @@ def main():
     print("3. 可以将 exe 放在任何位置（需要同目录有 config.json）")
     print("\n提示:")
     print("- 第一次运行会弹出 UAC 权限提升请求（正常，因为要修改网络适配器）")
-    print("- 可以配置开机自启（见 SETUP_GUIDE.md）")
+    print("- 可以配置开机自启（见 docs/SETUP_GUIDE.md）")
     
     return True
 
