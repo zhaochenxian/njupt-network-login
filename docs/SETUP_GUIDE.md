@@ -73,6 +73,21 @@ MORNING_HOUR = 7              # 自动启用时间（小时）
 CAMPUS_NETWORK_URL = "https://p.njupt.edu.cn:802/"
 ```
 
+同时也可以在 `config/config.json` 里覆盖这些参数：
+
+```json
+{
+   "adapter_name": "linenet",
+   "check_interval": 60,
+   "morning_hour": 7
+}
+```
+
+说明：
+- `morning_hour` 采用“当天超过该时间后补执行一次”的逻辑。
+- 例如电脑在 10:00 开机，也会执行当天的自动启用与登录。
+- 如果 `adapter_name` 不存在，程序会自动探测常见有线网卡名（如 Ethernet/以太网）作为兜底。
+
 ---
 
 ## 日志

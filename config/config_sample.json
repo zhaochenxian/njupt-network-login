@@ -1,5 +1,8 @@
 {
     "account": ",0,学号@cmcc",
     "password": "你的密码",
-    "interval": 10
+    "interval": 10,
+    "adapter_name": "linenet",
+    "check_interval": 60,
+    "morning_hour": 7
 }
