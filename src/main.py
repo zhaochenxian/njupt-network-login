@@ -14,9 +14,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def load_config():
     """读取配置文件"""
-    config_path = 'config.json'
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'config.json')
     if not os.path.exists(config_path):
-        print(f"[!] 错误: 找不到 {config_path} 文件。")
+        print(f"[!] 错误: 找不到配置文件，请检查 config/config.json")
         sys.exit(1)
 
     try:
