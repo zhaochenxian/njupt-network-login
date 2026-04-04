@@ -1,8 +1,17 @@
 {
     "account": ",0,学号@cmcc",
     "password": "你的密码",
-    "interval": 10,
+
     "adapter_name": "linenet",
+
+    "morning_hour": 7,
+    "morning_minute": 0,
+
+    "cutoff_hour": 23,
+    "cutoff_minute": 30,
+    "disable_advance_min": 2,
+
     "check_interval": 60,
-    "morning_hour": 7
+    "login_retry_cooldown": 300,
+    "interval": 5
 }

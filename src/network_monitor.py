@@ -1,353 +1,379 @@
 """
-校园网自动化监控脚本
-- 监控校园网连接状态
-- 校园网断开时自动禁用有线网
-- 每天早上自动启用有线网并连接
-- 支持后台持续运行
+校园网智能监控守护进程
+
+功能：
+  1. 断网前自动禁用有线网卡（防止系统卡在等待 DHCP 续约）
+  2. 早晨指定时间自动启用有线网卡并登录
+  3. 随时检测到未认证状态时自动触发登录
+  4. 联网查询法定节假日（NateScarlet/holiday-cn），自动处理调休
+
+断网规则：
+  - 今晚要不要断网 = 明天要不要上班
+  - 明天是工作日（含调休上班）→ 今晚23:30断网 → 需要禁用网卡
+  - 明天是休息日（含法定假日）→ 今晚不断网 → 不用禁用网卡
+
+用法：
+  python src/network_monitor.py          # 正常启动守护进程
+  python src/network_monitor.py --once   # 只执行一次登录（用于调试）
 """
 
 import os
 import sys
+import json
 import time
+import socket
 import datetime
 import subprocess
-import re
-import requests
 import urllib3
+import requests
 
-# 禁用安全请求警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 配置
-ADAPTER_NAME = "linenet"  # 默认网络适配器名称（会被配置/自动探测覆盖）
-LOG_FILE = "network_monitor.log"
-CHECK_INTERVAL = 60  # 检查间隔（秒）
-CAMPUS_NETWORK_URL = "https://p.njupt.edu.cn:802/"  # 校园网地址
-MORNING_HOUR = 7  # 每天早上7点自动启用
-LOGIN_RETRY_INTERVAL = 300  # 登录重试间隔（秒）
+# ──────────────────────────────────────────────
+#  节假日数据
+# ──────────────────────────────────────────────
 
-CONNECTIVITY_CHECK_URLS = [
-    "https://www.baidu.com",
-    "https://www.qq.com",
-    "http://www.msftconnecttest.com/connecttest.txt"
+# holiday-cn 数据源（按优先级尝试）
+_HOLIDAY_URLS = [
+    "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json",
+    "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json",
 ]
 
-
-def load_monitor_config():
-    """读取监控配置（可选）"""
-    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "config.json")
-    if not os.path.exists(config_path):
-        return {}
-
-    try:
-        import json
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log_message(f"[!] 读取监控配置失败，将使用默认配置: {e}")
-        return {}
+# 缓存：{年份: {日期字符串: is_off_day(True=休息)}}
+_holiday_cache: dict = {}
 
 
-def get_adapter_list():
-    """获取系统网络适配器列表"""
-    try:
-        result = subprocess.run(
-            ["netsh", "interface", "show", "interface"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            encoding="utf-8",
-            errors="ignore"
-        )
-        if result.returncode != 0:
-            return []
-
-        adapters = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line or line.startswith("---") or "Admin State" in line:
-                continue
-            parts = re.split(r"\s{2,}", line)
-            if len(parts) >= 4:
-                adapters.append({
-                    "admin_state": parts[0],
-                    "state": parts[1],
-                    "type": parts[2],
-                    "name": parts[3]
-                })
-        return adapters
-    except Exception:
-        return []
-
-
-def resolve_adapter_name(preferred_name):
-    """解析最终要使用的网络适配器名称（配置优先，自动探测兜底）"""
-    adapters = get_adapter_list()
-    if not adapters:
-        return preferred_name
-
-    names = [adapter["name"] for adapter in adapters]
-    if preferred_name in names:
-        return preferred_name
-
-    candidate_names = ["linenet", "Ethernet", "以太网", "本地连接"]
-    for candidate in candidate_names:
-        if candidate in names:
-            log_message(f"[*] 未找到配置网卡 '{preferred_name}'，自动使用 '{candidate}'")
-            return candidate
-
-    for adapter in adapters:
-        if adapter["type"].lower() == "dedicated":
-            log_message(f"[*] 未找到常见网卡名，自动使用首个有线网卡 '{adapter['name']}'")
-            return adapter["name"]
-
-    log_message(f"[*] 未探测到可用有线网卡，继续使用配置值 '{preferred_name}'")
-    return preferred_name
-
-
-def log_message(message):
-    """输出日志"""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_text = f"[{timestamp}] {message}"
-    print(log_text)
-    
-    # 同时写入日志文件
-    try:
-        with open(LOG_FILE, 'a', encoding='utf-8') as f:
-            f.write(log_text + '\n')
-    except:
-        pass
-
-
-def run_command_as_admin(command):
-    """以管理员身份运行命令"""
-    try:
-        # 使用 PowerShell 的 Start-Process -Verb RunAs
-        ps_command = f'Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command {command}" -Verb RunAs -WindowStyle Hidden -Wait'
-        subprocess.run(['powershell', '-Command', ps_command], check=True, capture_output=True)
-        return True
-    except Exception as e:
-        log_message(f"[!] 命令执行失败: {e}")
-        return False
-
-
-def set_adapter_state(state: str):
+def _fetch_holiday_year(year: int) -> dict:
     """
-    启用或禁用网络适配器
-    state: "enable" 或 "disable"
+    从 holiday-cn 获取指定年份的特殊日期映射。
+    返回 {date_str: bool}，True=休息日，False=调休上班日。
     """
-    if state.lower() == "enable":
-        command = f'netsh interface set interface name="{ADAPTER_NAME}" admin=enable'
-        log_message(f"正在尝试启用网络适配器 '{ADAPTER_NAME}'...")
-    else:
-        command = f'netsh interface set interface name="{ADAPTER_NAME}" admin=disable'
-        log_message(f"正在尝试禁用网络适配器 '{ADAPTER_NAME}'...")
-    
-    # 使用 cmd /c 执行
-    try:
-        result = subprocess.run(['cmd', '/c', command], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            log_message(f"[+] 网络适配器操作成功")
-            return True
-        else:
-            log_message(f"[!] 网络适配器操作可能失败: {result.stderr}")
-            return False
-    except Exception as e:
-        log_message(f"[!] 执行网络适配器命令时出错: {e}")
-        return False
-
-
-def can_reach_internet():
-    """检查是否可访问外网（用于判断是否已认证出网）"""
-    for url in CONNECTIVITY_CHECK_URLS:
+    for url_tpl in _HOLIDAY_URLS:
+        url = url_tpl.format(year=year)
         try:
-            response = requests.get(url, timeout=3, verify=False, allow_redirects=True)
-            if response.status_code in (200, 204):
-                return True
-        except Exception:
-            continue
-    return False
+            resp = requests.get(url, timeout=10, verify=False)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = {d["date"]: bool(d["isOffDay"]) for d in data.get("days", [])}
+                print(f"[holiday] 已加载 {year} 年节假日数据（{len(result)} 条特殊日期）")
+                return result
+        except Exception as e:
+            print(f"[holiday] {url[:60]} 失败: {e}")
+    print(f"[holiday] 警告：无法获取 {year} 年节假日数据，回退到星期规则")
+    return {}
 
 
-def check_network_state():
+def is_workday(date: datetime.date) -> bool:
     """
-    检查网络状态：
-    - authenticated: 已认证，可访问外网
-    - captive: 可访问校园网登录页，但外网不可达（需要登录）
-    - offline: 校园网与外网都不可达
+    判断指定日期是否为工作日。
+    优先使用在线节假日数据，网络不通时回退到星期规则（周一~五=工作日）。
     """
-    portal_reachable = False
+    year = date.year
+    if year not in _holiday_cache:
+        _holiday_cache[year] = _fetch_holiday_year(year)
 
+    date_str = date.strftime("%Y-%m-%d")
+    special = _holiday_cache.get(year, {})
+
+    if date_str in special:
+        # True = 休息日（法定假日或调休休息），False = 调休上班日
+        return not special[date_str]
+
+    # 普通日期：周一(0)~周五(4) 是工作日
+    return date.weekday() <= 4
+
+
+def is_cutoff_night(dt: datetime.datetime) -> bool:
+    """
+    今晚要不要断网：若明天是工作日，今晚就断网。
+    """
+    tomorrow = (dt + datetime.timedelta(days=1)).date()
+    return is_workday(tomorrow)
+
+
+# ──────────────────────────────────────────────
+#  配置加载
+# ──────────────────────────────────────────────
+
+def load_config() -> dict:
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "config", "config.json"
+    )
+    if not os.path.exists(config_path):
+        print("[!] 找不到 config/config.json，请先复制 config_sample.json 并填写账号密码")
+        sys.exit(1)
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ──────────────────────────────────────────────
+#  网卡控制
+# ──────────────────────────────────────────────
+
+def _run_netsh(action: str, adapter: str) -> bool:
+    """
+    用 netsh 启用/禁用网卡。需要管理员权限。
+    action: "enable" 或 "disable"
+    """
+    cmd = ["netsh", "interface", "set", "interface", f'"{adapter}"', action]
     try:
-        requests.get(
-            CAMPUS_NETWORK_URL,
-            timeout=3,
-            verify=False,
-            allow_redirects=True
-        )
-        portal_reachable = True
-    except requests.exceptions.Timeout:
-        portal_reachable = False
-    except requests.exceptions.ConnectionError:
-        portal_reachable = False
-    except Exception as e:
-        log_message(f"[?] 校园网检测出错: {e}")
-        portal_reachable = False
-
-    internet_reachable = can_reach_internet()
-
-    if internet_reachable:
-        return "authenticated"
-    if portal_reachable:
-        return "captive"
-    return "offline"
-
-
-def run_login_script():
-    """运行登录脚本"""
-    try:
-        log_message("正在运行登录脚本...")
-        script_path = os.path.join(os.path.dirname(__file__), 'main.py')
-        result = subprocess.run(
-            [sys.executable, script_path],
+        ret = subprocess.run(
+            " ".join(cmd),
+            shell=True,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=15,
         )
-        if result.returncode == 0:
-            log_message("[+] 登录脚本执行成功")
+        if ret.returncode == 0:
+            return True
+        print(f"[netsh] 错误: {ret.stderr.strip() or ret.stdout.strip()}")
+        return False
+    except Exception as e:
+        print(f"[netsh] 异常: {e}")
+        return False
+
+
+def disable_adapter(adapter: str) -> bool:
+    ok = _run_netsh("disable", adapter)
+    if ok:
+        print(f"[网卡] 已禁用 '{adapter}'")
+    else:
+        print(f"[网卡] 禁用 '{adapter}' 失败（需要管理员权限？）")
+    return ok
+
+
+def enable_adapter(adapter: str) -> bool:
+    ok = _run_netsh("enable", adapter)
+    if ok:
+        print(f"[网卡] 已启用 '{adapter}'")
+    else:
+        print(f"[网卡] 启用 '{adapter}' 失败（需要管理员权限？）")
+    return ok
+
+
+# ──────────────────────────────────────────────
+#  网络状态检测
+# ──────────────────────────────────────────────
+
+def get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def needs_login() -> bool:
+    """
+    检测是否需要登录校园网（检测到 captive portal 重定向或无法访问外网）。
+    """
+    try:
+        resp = requests.get(
+            "http://connect.rom.miui.com/generate_204",
+            timeout=5,
+            allow_redirects=True,
+            verify=False,
+        )
+        # 204 = 已联网；其他状态码或被重定向到认证页 = 需要登录
+        if resp.status_code == 204:
+            return False
+        return True
+    except requests.exceptions.ConnectionError:
+        return True
+    except Exception:
+        return True
+
+
+def is_adapter_up(adapter: str) -> bool:
+    """
+    检测网卡是否处于启用状态。
+    """
+    try:
+        ret = subprocess.run(
+            f'netsh interface show interface "{adapter}"',
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return "已启用" in ret.stdout or "Enabled" in ret.stdout
+    except Exception:
+        return False
+
+
+# ──────────────────────────────────────────────
+#  登录请求
+# ──────────────────────────────────────────────
+
+def do_login(account: str, password: str) -> bool:
+    """
+    执行一次登录请求。
+    返回 True = 成功（或已在线），False = 失败需重试。
+    """
+    import random
+
+    url = "https://p.njupt.edu.cn:802/eportal/portal/login"
+    ip = get_local_ip()
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+
+    params = {
+        "callback": "dr1003",
+        "login_method": "1",
+        "user_account": account,
+        "user_password": password,
+        "wlan_user_ip": ip,
+        "wlan_user_ipv6": "",
+        "wlan_user_mac": "000000000000",
+        "wlan_ac_ip": "",
+        "wlan_ac_name": "",
+        "jsVersion": "4.1.3",
+        "terminal_type": "1",
+        "lang": "zh-cn",
+        "v": str(random.randint(1000, 9999)),
+    }
+    headers = {
+        "Host": "p.njupt.edu.cn:802",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/142.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://p.njupt.edu.cn/",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, verify=False, timeout=8)
+        text = resp.text
+        if '"result":1' in text or "Portal协议认证成功" in text:
+            print(f"[{now}] [+] 登录成功！(IP: {ip})")
+            return True
+        elif "AC999" in text or '"ret_code":2' in text:
+            print(f"[{now}] [=] 已在线，无需重复登录。")
             return True
         else:
-            log_message(f"[!] 登录脚本执行失败: {result.stderr}")
+            print(f"[{now}] [?] 登录未成功，响应: {text[:120]}")
             return False
-    except Exception as e:
-        log_message(f"[!] 运行登录脚本时出错: {e}")
+    except requests.exceptions.RequestException as e:
+        print(f"[{now}] [!] 网络异常: {e}")
         return False
 
 
-def should_enable_morning(current_time, last_morning_check):
-    """检查是否应执行当天早间自动启用（超过阈值后当天补执行一次）"""
-    if last_morning_check == current_time.date():
-        return False
-    return current_time.hour >= MORNING_HOUR
+# ──────────────────────────────────────────────
+#  守护主循环
+# ──────────────────────────────────────────────
 
+def monitor_loop(cfg: dict):
+    account = cfg["account"]
+    password = cfg["password"]
+    adapter = cfg.get("adapter_name", "以太网")
 
-def main_monitor_loop():
-    """主监控循环"""
-    log_message("=" * 50)
-    log_message("校园网自动化监控脚本已启动")
-    log_message(f"网络适配器: {ADAPTER_NAME}")
-    log_message(f"检查间隔: {CHECK_INTERVAL} 秒")
-    log_message(f"早上启用时间: {MORNING_HOUR}:00")
-    log_message("=" * 50)
-    
-    last_morning_check = None
-    last_adapter_state = None
-    last_network_state = None
-    last_login_attempt = None
-    
+    morning_hour   = int(cfg.get("morning_hour",   7))
+    morning_minute = int(cfg.get("morning_minute", 0))
+    cutoff_hour    = int(cfg.get("cutoff_hour",   23))
+    cutoff_minute  = int(cfg.get("cutoff_minute", 30))
+    advance_min    = int(cfg.get("disable_advance_min", 2))
+    check_interval = int(cfg.get("check_interval", 60))
+    login_cooldown = int(cfg.get("login_retry_cooldown", 300))
+
+    # 状态标志
+    adapter_disabled_tonight = False   # 今晚是否已经禁用了网卡
+    morning_triggered_today  = False   # 今天早上是否已经触发了启用
+    last_login_attempt       = 0.0    # 上次尝试登录的时间戳（用于冷却）
+
+    # 每天零点重置标志位
+    last_date = datetime.date.today()
+
+    print(f"[monitor] 守护进程启动，检测间隔 {check_interval}s")
+    print(f"[monitor] 网卡名称: {adapter}")
+    print(f"[monitor] 早起时间: {morning_hour:02d}:{morning_minute:02d}")
+    print(f"[monitor] 断网时间: {cutoff_hour:02d}:{cutoff_minute:02d}（提前 {advance_min} 分钟禁用）")
+
     while True:
         try:
-            current_time = datetime.datetime.now()
-            network_state = check_network_state()
+            now = datetime.datetime.now()
+            today = now.date()
 
-            if network_state != last_network_state:
-                if network_state == "authenticated":
-                    log_message("[+] 网络已认证，可访问外网")
-                elif network_state == "captive":
-                    log_message("[!] 检测到校园网登录页可达，但外网不可达（需要登录）")
-                else:
-                    log_message("[-] 校园网与外网均不可达（离线）")
-                last_network_state = network_state
-            
-            # 逻辑1: 如果校园网断开，禁用有线网适配器
-            if network_state == "offline":
-                if last_adapter_state != "disabled":
-                    log_message("[*] 校园网已断开，正在禁用有线网适配器...")
-                    set_adapter_state("disable")
-                    last_adapter_state = "disabled"
+            # ── 跨天重置 ──────────────────────────────
+            if today != last_date:
+                last_date = today
+                adapter_disabled_tonight = False
+                morning_triggered_today  = False
+                print(f"[monitor] 新的一天 {today}，重置状态标志")
+                # 提前加载今年/明年节假日数据
+                is_workday(today)
+                is_workday(today + datetime.timedelta(days=1))
 
-            # 逻辑1.5: 如果是登录页状态（可达但未认证），自动尝试登录
-            if network_state == "captive":
-                now = datetime.datetime.now()
-                can_retry = (
-                    last_login_attempt is None
-                    or (now - last_login_attempt).total_seconds() >= LOGIN_RETRY_INTERVAL
-                )
-                if can_retry:
-                    log_message("[*] 正在尝试自动登录校园网...")
-                    set_adapter_state("enable")
-                    time.sleep(3)
-                    run_login_script()
-                    last_login_attempt = now
-                    last_adapter_state = "enabled"
-            
-            # 逻辑2: 每天早上自动启用有线网并尝试连接
-            if should_enable_morning(current_time, last_morning_check):
-                if last_morning_check != current_time.date():
-                    log_message(f"[*] 检测到早上 {MORNING_HOUR}:00，正在启用有线网并连接...")
-                    set_adapter_state("enable")
-                    time.sleep(10)  # 等待网卡启用
-                    run_login_script()
-                    last_morning_check = current_time.date()
-                    last_adapter_state = "enabled"
-            
-            # 逻辑3: 校园网在线时，确保有线网已启用
-            elif network_state in ("authenticated", "captive") and last_adapter_state != "enabled":
-                log_message("[*] 校园网在线但有线网被禁用，正在重新启用...")
-                set_adapter_state("enable")
-                last_adapter_state = "enabled"
-            
-            # 等待下一轮检查
-            time.sleep(CHECK_INTERVAL)
-            
+            # ── 路径A：断网前禁用网卡 ────────────────
+            if not adapter_disabled_tonight and is_cutoff_night(now):
+                cutoff_total   = cutoff_hour * 60 + cutoff_minute
+                current_total  = now.hour * 60 + now.minute
+                minutes_to_cut = cutoff_total - current_total
+
+                # 在 [断网前 advance_min 分钟, 断网后 60 分钟] 窗口内触发
+                if -60 <= minutes_to_cut <= advance_min:
+                    print(f"[monitor] 今晚断网，距断网 {minutes_to_cut} 分钟，禁用网卡...")
+                    if disable_adapter(adapter):
+                        adapter_disabled_tonight = True
+                    # 等到明天早上前，每5分钟检查一次就够了
+                    time.sleep(300)
+                    continue
+
+            # ── 路径B：早晨启用网卡并登录 ────────────
+            if not morning_triggered_today:
+                morning_total  = morning_hour * 60 + morning_minute
+                current_total  = now.hour * 60 + now.minute
+
+                # 已过早起时间且网卡处于禁用状态
+                if current_total >= morning_total and not is_adapter_up(adapter):
+                    print(f"[monitor] 早起时间到，启用网卡...")
+                    enable_adapter(adapter)
+                    morning_triggered_today = True
+                    print("[monitor] 等待 10s DHCP 获取地址...")
+                    time.sleep(10)
+                    # 尝试登录
+                    do_login(account, password)
+                    last_login_attempt = time.time()
+                    time.sleep(check_interval)
+                    continue
+
+            # ── 路径C：随时检测未认证状态 ────────────
+            # 网卡必须是启用状态才值得检测
+            if is_adapter_up(adapter):
+                now_ts = time.time()
+                if now_ts - last_login_attempt >= login_cooldown:
+                    if needs_login():
+                        print(f"[monitor] 检测到未认证，尝试登录...")
+                        do_login(account, password)
+                        last_login_attempt = now_ts
+
         except KeyboardInterrupt:
-            log_message("[*] 监控脚本已停止")
+            print("\n[monitor] 用户中断，退出。")
             break
         except Exception as e:
-            log_message(f"[!] 监控循环出错: {e}")
-            time.sleep(CHECK_INTERVAL)
+            print(f"[monitor] 意外错误: {e}")
+
+        time.sleep(check_interval)
+
+
+# ──────────────────────────────────────────────
+#  入口
+# ──────────────────────────────────────────────
+
+def main():
+    cfg = load_config()
+
+    if "--once" in sys.argv:
+        # 单次登录模式（用于调试或手动触发）
+        do_login(cfg["account"], cfg["password"])
+        return
+
+    monitor_loop(cfg)
 
 
 if __name__ == "__main__":
-    # 检查是否是管理员权限
-    try:
-        import ctypes
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception:
-        is_admin = False
-    
-    if not is_admin:
-        log_message("[!] 检测到非管理员权限，正在以管理员身份重新启动...")
-        try:
-            import ctypes
-            # 重新启动为管理员
-            if hasattr(sys, 'frozen'):  # 如果是 exe
-                script = sys.executable
-            else:
-                script = sys.executable
-            
-            params = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in sys.argv])
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", script, params, None, 1)
-            sys.exit()
-        except Exception as e:
-            log_message(f"[!] 权限提升失败: {e}")
-            log_message("[!] 请右键选择'以管理员身份运行'")
-            input("按 Enter 退出...")
-            sys.exit(1)
-    
-    # 读取运行配置
-    runtime_config = load_monitor_config()
-    try:
-        if "check_interval" in runtime_config:
-            CHECK_INTERVAL = int(runtime_config.get("check_interval", CHECK_INTERVAL))
-        if "morning_hour" in runtime_config:
-            MORNING_HOUR = int(runtime_config.get("morning_hour", MORNING_HOUR))
-    except Exception:
-        pass
-
-    configured_adapter = runtime_config.get("adapter_name", ADAPTER_NAME)
-    ADAPTER_NAME = resolve_adapter_name(configured_adapter)
-
-    log_message("✓ 已获取管理员权限")
-    main_monitor_loop()
+    main()

@@ -1,14 +1,5 @@
 # 校园网自动化监控 - 使用指南
 
-## 说明
-
-当前仓库不再包含 `start_monitor.bat`，请使用以下两种方式之一启动：
-
-- Python 脚本：`python src/network_monitor.py`
-- Release 附件：下载并运行 `NJUPTNetworkMonitor.exe`
-
----
-
 ## 快速开始
 
 ### 方式 A：Python 运行（推荐开发者）
@@ -21,14 +12,19 @@ pip install -r requirements.txt
 
 2. 配置账号：
 
-- 复制 `config/config_sample.json` 为 `config/config.json`
-- 填入学号和密码
+```
+cp config/config_sample.json config/config.json
+```
 
-3. 启动监控：
+编辑 `config/config.json`，填入学号和密码。
+
+3. 启动监控（**需要管理员权限**）：
 
 ```
 python src/network_monitor.py
 ```
+
+程序会自动请求 UAC 权限提升。
 
 ---
 
@@ -36,65 +32,74 @@ python src/network_monitor.py
 
 1. 从 Release 页面下载 `NJUPTNetworkMonitor.exe`
 2. 右键 exe → 以管理员身份运行
+3. 将 `config.json` 放在 exe 同目录下
 
 ---
 
 ## 开机自启（任务计划程序）
 
-### 方案 1：Python 版
-
 1. Win + R 输入 `taskschd.msc`
-2. 创建任务，触发器选“计算机启动时”
-3. 操作选择“启动程序”
-   - 程序或脚本：`python.exe` 的完整路径
-   - 添加参数：`src\\network_monitor.py`
-   - 起始于：仓库根目录（例如 `C:\\njupt-login`）
-4. 在“常规”中勾选“使用最高权限运行”
-
-### 方案 2：EXE 版
-
-1. Win + R 输入 `taskschd.msc`
-2. 创建任务，触发器选“计算机启动时”
-3. 操作选择“启动程序”
-   - 程序或脚本：`NJUPTNetworkMonitor.exe` 的完整路径
-   - 起始于：exe 所在目录
-4. 在“常规”中勾选“使用最高权限运行”
+2. 点击"创建任务"
+3. **常规** 选项卡：
+   - 名称：`NJUPT 校园网监控`
+   - 勾选"使用最高权限运行"
+4. **触发器** 选项卡：
+   - 新建触发器 → 开始任务选"计算机启动时"
+5. **操作** 选项卡（Python 版）：
+   - 程序或脚本：`python.exe` 完整路径（例如 `C:\Python311\python.exe`）
+   - 添加参数：`src\network_monitor.py`
+   - 起始于：仓库根目录（例如 `C:\njupt-login`）
+6. **条件** 选项卡：
+   - 取消勾选"只在计算机使用交流电时启动任务"
 
 ---
 
-## 配置项
+## 配置说明
 
-编辑 `src/network_monitor.py`：
-
-```python
-ADAPTER_NAME = "linenet"      # 网络适配器名称
-CHECK_INTERVAL = 60           # 检查间隔（秒）
-MORNING_HOUR = 7              # 自动启用时间（小时）
-CAMPUS_NETWORK_URL = "https://p.njupt.edu.cn:802/"
-```
-
-同时也可以在 `config/config.json` 里覆盖这些参数：
+编辑 `config/config.json`：
 
 ```json
 {
-   "adapter_name": "linenet",
-   "check_interval": 60,
-   "morning_hour": 7
+    "account": ",0,学号@cmcc",
+    "password": "你的密码",
+    "adapter_name": "linenet",
+    "morning_hour": 7,
+    "morning_minute": 0,
+    "cutoff_hour": 23,
+    "cutoff_minute": 30,
+    "disable_advance_min": 2,
+    "check_interval": 60,
+    "login_retry_cooldown": 300
 }
 ```
 
-说明：
-- `morning_hour` 采用“当天超过该时间后补执行一次”的逻辑。
-- 例如电脑在 10:00 开机，也会执行当天的自动启用与登录。
-- 如果 `adapter_name` 不存在，程序会自动探测常见有线网卡名（如 Ethernet/以太网）作为兜底。
+| 字段 | 说明 |
+|------|------|
+| `adapter_name` | 有线网卡名称，用 `ipconfig /all` 查看 |
+| `morning_hour/minute` | 早上几点自动启用有线网并登录 |
+| `cutoff_hour/minute` | 校园网几点断网（默认 23:30） |
+| `disable_advance_min` | 提前几分钟禁用有线网（默认 2 分钟） |
+| `check_interval` | 主循环检查间隔（秒） |
+| `login_retry_cooldown` | 登录失败后多久再重试（秒） |
+
+### 断网日历
+
+程序内置的断网逻辑（不需要手动配置）：
+
+- 周一 ~ 周四：23:30 断网
+- 周五：**不断网**
+- 周六：**不断网**
+- 周日：23:30 断网
+
+如果你的学校断网规律不同，修改 `network_monitor.py` 中的 `is_cutoff_day()` 函数即可。
 
 ---
 
 ## 日志
 
-日志文件默认在运行目录下，文件名：`network_monitor.log`
+日志文件默认生成在运行目录下，文件名：`network_monitor.log`
 
-查看方式：
+查看日志：
 
 ```
 type network_monitor.log
@@ -104,14 +109,25 @@ type network_monitor.log
 
 ## 故障排除
 
-1. 无管理员权限
-   - 请右键“以管理员身份运行”
-   - 任务计划程序中启用“使用最高权限运行”
+### 网卡名不对，无法禁用/启用
 
-2. 网卡操作失败
-   - 用 `ipconfig /all` 确认网卡名
-   - 修改 `ADAPTER_NAME`
+用 `ipconfig /all` 查看你的有线网卡名称，然后修改 `config.json` 中的 `adapter_name`。
 
-3. 无法登录
-   - 检查 `config/config.json`
-   - 查看 `network_monitor.log` 错误信息
+常见网卡名：`linenet`、`Ethernet`、`以太网`、`本地连接`
+
+### 无管理员权限导致网卡操作失败
+
+- Python 版：脚本会自动弹出 UAC 提升请求，点"是"即可
+- 任务计划程序：确认已勾选"使用最高权限运行"
+
+### 登录失败
+
+- 检查 `config.json` 中 `account` 格式是否为 `,0,学号@cmcc`
+- 查看 `network_monitor.log` 中的具体错误信息
+- 手动运行 `python src/main.py` 测试登录
+
+### 脚本在断网日没有自动禁用网卡
+
+检查日志，确认 `should_disable_now` 时间窗口是否覆盖了你的实际情况：
+- 默认在断网前 2 分钟（23:28）触发，到断网后 30 分钟内均会重试
+- 可以调大 `disable_advance_min`（例如改为 5）让触发时间更早
