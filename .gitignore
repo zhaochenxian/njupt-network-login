@@ -2,6 +2,7 @@
 config/config.json
 config/*.json
 !config/config_sample.json
+!config/holiday_*.json
 
 # 日志文件
 *.log
@@ -38,6 +39,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.workbuddy/
 *.swp
 *.swo
 *~

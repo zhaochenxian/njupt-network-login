@@ -24,6 +24,7 @@ import time
 import socket
 import datetime
 import subprocess
+import random
 import urllib3
 import requests
 
@@ -39,14 +40,52 @@ _HOLIDAY_URLS = [
     "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json",
 ]
 
-# 缓存：{年份: {日期字符串: is_off_day(True=休息)}}
+# 本地缓存文件目录（与 config/ 同级）
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config")
+
+# 内存缓存：{年份: {日期字符串: is_off_day(True=休息)}}
 _holiday_cache: dict = {}
+# 记录每年数据的最后联网拉取日期，用于每天尝试刷新
+_holiday_fetch_date: dict = {}
+
+
+def _cache_file(year: int) -> str:
+    """返回本地缓存文件路径。"""
+    return os.path.join(_CACHE_DIR, f"holiday_{year}.json")
+
+
+def _load_local_cache(year: int) -> dict:
+    """从本地文件加载节假日缓存，文件不存在则返回空字典。"""
+    path = _cache_file(year)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"[holiday] 从本地缓存加载 {year} 年节假日数据（{len(data)} 条）")
+        return data
+    except Exception as e:
+        print(f"[holiday] 读取本地缓存失败: {e}")
+        return {}
+
+
+def _save_local_cache(year: int, data: dict):
+    """将节假日数据写入本地缓存文件。"""
+    path = _cache_file(year)
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[holiday] 写入本地缓存失败: {e}")
 
 
 def _fetch_holiday_year(year: int) -> dict:
     """
     从 holiday-cn 获取指定年份的特殊日期映射。
-    返回 {date_str: bool}，True=休息日，False=调休上班日。
+    联网成功时同步写入本地缓存文件。
+    联网失败时尝试读取本地缓存文件。
+    均失败则返回空字典（回退到星期规则）。
     """
     for url_tpl in _HOLIDAY_URLS:
         url = url_tpl.format(year=year)
@@ -55,10 +94,18 @@ def _fetch_holiday_year(year: int) -> dict:
             if resp.status_code == 200:
                 data = resp.json()
                 result = {d["date"]: bool(d["isOffDay"]) for d in data.get("days", [])}
-                print(f"[holiday] 已加载 {year} 年节假日数据（{len(result)} 条特殊日期）")
+                print(f"[holiday] 已联网加载 {year} 年节假日数据（{len(result)} 条特殊日期）")
+                _save_local_cache(year, result)
                 return result
         except Exception as e:
             print(f"[holiday] {url[:60]} 失败: {e}")
+
+    # 联网全部失败，尝试本地缓存
+    local = _load_local_cache(year)
+    if local:
+        print(f"[holiday] 无网络，使用本地缓存数据（{year} 年，{len(local)} 条）")
+        return local
+
     print(f"[holiday] 警告：无法获取 {year} 年节假日数据，回退到星期规则")
     return {}
 
@@ -66,11 +113,20 @@ def _fetch_holiday_year(year: int) -> dict:
 def is_workday(date: datetime.date) -> bool:
     """
     判断指定日期是否为工作日。
-    优先使用在线节假日数据，网络不通时回退到星期规则（周一~五=工作日）。
+    优先使用在线节假日数据，联网失败时使用本地缓存，
+    两者均无时回退到星期规则（周一~五=工作日）。
+    每天至多尝试一次联网刷新缓存。
     """
     year = date.year
-    if year not in _holiday_cache:
-        _holiday_cache[year] = _fetch_holiday_year(year)
+    today = datetime.date.today()
+
+    # 首次加载 或 今天还没联网刷新过该年份数据
+    if year not in _holiday_cache or _holiday_fetch_date.get(year) != today:
+        fetched = _fetch_holiday_year(year)
+        _holiday_cache[year] = fetched
+        # 仅当联网成功（数据非空或本地有缓存）时才标记今天已刷新
+        if fetched or os.path.exists(_cache_file(year)):
+            _holiday_fetch_date[year] = today
 
     date_str = date.strftime("%Y-%m-%d")
     special = _holiday_cache.get(year, {})
@@ -102,8 +158,12 @@ def load_config() -> dict:
     if not os.path.exists(config_path):
         print("[!] 找不到 config/config.json，请先复制 config_sample.json 并填写账号密码")
         sys.exit(1)
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[!] 读取配置文件失败: {e}")
+        sys.exit(1)
 
 
 # ──────────────────────────────────────────────
@@ -213,8 +273,6 @@ def do_login(account: str, password: str) -> bool:
     执行一次登录请求。
     返回 True = 成功（或已在线），False = 失败需重试。
     """
-    import random
-
     url = "https://p.njupt.edu.cn:802/eportal/portal/login"
     ip = get_local_ip()
     now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -293,6 +351,11 @@ def monitor_loop(cfg: dict):
     print(f"[monitor] 早起时间: {morning_hour:02d}:{morning_minute:02d}")
     print(f"[monitor] 断网时间: {cutoff_hour:02d}:{cutoff_minute:02d}（提前 {advance_min} 分钟禁用）")
 
+    # 启动时立即预加载当年及明年节假日数据
+    today_init = datetime.date.today()
+    is_workday(today_init)
+    is_workday(today_init + datetime.timedelta(days=1))
+
     while True:
         try:
             now = datetime.datetime.now()
@@ -319,23 +382,25 @@ def monitor_loop(cfg: dict):
                     print(f"[monitor] 今晚断网，距断网 {minutes_to_cut} 分钟，禁用网卡...")
                     if disable_adapter(adapter):
                         adapter_disabled_tonight = True
-                    # 等到明天早上前，每5分钟检查一次就够了
-                    time.sleep(300)
-                    continue
+                        # 禁用成功后等到明天早上前，每5分钟检查一次就够了
+                        time.sleep(300)
+                        continue
+                    # 禁用失败（权限不足等），按正常间隔重试
 
             # ── 路径B：早晨启用网卡并登录 ────────────
             if not morning_triggered_today:
                 morning_total  = morning_hour * 60 + morning_minute
                 current_total  = now.hour * 60 + now.minute
 
-                # 已过早起时间且网卡处于禁用状态
-                if current_total >= morning_total and not is_adapter_up(adapter):
-                    print(f"[monitor] 早起时间到，启用网卡...")
-                    enable_adapter(adapter)
+                # 已过早起时间：若网卡禁用则先启用，之后无论如何都尝试登录
+                if current_total >= morning_total:
                     morning_triggered_today = True
-                    print("[monitor] 等待 10s DHCP 获取地址...")
-                    time.sleep(10)
-                    # 尝试登录
+                    if not is_adapter_up(adapter):
+                        print(f"[monitor] 早起时间到，启用网卡...")
+                        enable_adapter(adapter)
+                        print("[monitor] 等待 10s DHCP 获取地址...")
+                        time.sleep(10)
+                    # 尝试登录（无论网卡原先是否启用）
                     do_login(account, password)
                     last_login_attempt = time.time()
                     time.sleep(check_interval)
